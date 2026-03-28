@@ -1,0 +1,26 @@
+# Python virtual environments
+venv/
+env/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Compiled binaries
+*.so
+*.dll
+*.dylib
+
+# Environment & logs
+.env
+*.log
+
+# Large model outputs
+results/*.pt
+results/*.pth
+models/*.pt
+models/*.pth
+*.onnx
