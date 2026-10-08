@@ -1,10 +1,3 @@
-# Python bytecode and cache
+# Python compiled files
 __pycache__/
 *.pyc
-
-# Logs
-logs/
-*.log
-
-# Results (generated artifacts)
-results/

@@ -1,0 +1,3 @@
+2026-10-08 15:57:49 | INFO     | Model ensemble loaded from ['/workspace/models/cloud_model.keras', '/workspace/models/best_cloud_model.keras']
+2026-10-08 15:57:49 | INFO     | Calibration temperature T=0.3487
+2026-10-08 15:57:51 | INFO     | predict ok: Other Cloud ☁️ conf=0.961 3991.3ms
