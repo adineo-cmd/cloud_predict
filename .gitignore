@@ -1,26 +1,10 @@
-# Python virtual environments
-venv/
-env/
-.venv/
-
-# Python bytecode
+# Python bytecode and cache
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# Compiled binaries
-*.so
-*.dll
-*.dylib
-
-# Environment & logs
-.env
+# Logs
+logs/
 *.log
 
-# Large model outputs
-results/*.pt
-results/*.pth
-models/*.pt
-models/*.pth
-*.onnx
+# Results (generated artifacts)
+results/
