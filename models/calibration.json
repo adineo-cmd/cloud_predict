@@ -1,0 +1,10 @@
+{
+  "temperature": 0.3487,
+  "fitted_on": "training_split",
+  "n_samples": 20,
+  "ece_before": 0.104,
+  "ece_after": 0.0838,
+  "avg_confidence_correct_before": 0.6715,
+  "avg_confidence_correct_after": 0.8525,
+  "model": "/workspace/models/cloud_model.keras"
+}

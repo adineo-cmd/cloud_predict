@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cumulonimbus Cloud Classifier</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --accent:#38bdf8; --text:#e2e8f0; --muted:#94a3b8; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text);
+           min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem; }
+    header { text-align: center; margin-bottom: 2rem; }
+    h1 { font-size: 1.9rem; letter-spacing: .5px; }
+    h1 span { color: var(--accent); }
+    .sub { color: var(--muted); margin-top: .4rem; font-size: .95rem; }
+    .card { background: var(--card); border-radius: 14px; padding: 1.6rem; width: 100%; max-width: 640px;
+            box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .drop { border: 2px dashed var(--muted); border-radius: 10px; padding: 2.2rem 1rem; text-align: center;
+           cursor: pointer; transition: border-color .2s, background .2s; }
+    .drop.dragover, .drop:hover { border-color: var(--accent); background: rgba(56,189,248,.06); }
+    #preview { max-width: 100%; border-radius: 10px; margin-top: 1rem; display: none; }
+    .controls { display: flex; gap: .8rem; flex-wrap: wrap; margin-top: 1rem; align-items: center; }
+    .controls label { color: var(--muted); font-size: .9rem; display:flex; align-items:center; gap:.35rem; }
+    input[type=range] { accent-color: var(--accent); }
+    button.primary { background: var(--accent); color: #04212f; border: none; padding: .7rem 1.4rem;
+                     border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 1rem; }
+    button.primary:disabled { opacity: .5; cursor: wait; }
+    .result { margin-top: 1.4rem; display: none; }
+    .badge { display:inline-block; padding:.45rem 1rem; border-radius: 999px; font-weight:700; font-size:1.05rem; }
+    .badge.cb { background:#7c3aed33; color:#c4b5fd; border:1px solid #7c3aed; }
+    .badge.other { background:#0ea5e933; color:#7dd3fc; border:1px solid #0ea5e9; }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:.8rem; margin-top:1rem; }
+    .metric { background:#0f172a; border-radius:8px; padding:.7rem; text-align:center; }
+    .metric .k { color:var(--muted); font-size:.75rem; text-transform:uppercase; letter-spacing:.5px; }
+    .metric .v { font-size:1.15rem; font-weight:700; margin-top:.2rem; }
+    #camimg { margin-top:1rem; width:100%; border-radius:10px; display:none; }
+    footer { margin-top:2rem; color:var(--muted); font-size:.8rem; }
+    .error { color:#f87171; margin-top:1rem; display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⛈️ Cumulonimbus <span>Cloud Classifier</span></h1>
+    <div class="sub">MobileNetV2 transfer learning · v{{ version }} · Grad-CAM explainability · TTA</div>
+  </header>
+
+  <div class="card">
+    <div class="drop" id="drop">
+      <strong>Drop a cloud image here</strong> or click to browse
+      <input type="file" id="file" accept="image/*" hidden />
+    </div>
+    <img id="preview" alt="preview" />
+
+    <div class="controls">
+      <label>Threshold <input type="range" id="thr" min="0.05" max="0.95" step="0.05" value="0.5" />
+        <span id="thrval">0.50</span></label>
+      <label>TTA runs <select id="tta"><option>1</option><option>3</option><option selected>5</option></select></label>
+      <label><input type="checkbox" id="gradcam" checked /> Grad-CAM</label>
+      <button class="primary" id="go" disabled>Analyze</button>
+    </div>
+
+    <div class="error" id="err"></div>
+    <div class="result" id="result">
+      <span class="badge" id="badge"></span>
+      <div class="metrics">
+        <div class="metric"><div class="k">Confidence</div><div class="v" id="conf"></div></div>
+        <div class="metric"><div class="k">Calibrated score</div><div class="v" id="score"></div></div>
+        <div class="metric"><div class="k">View agreement</div><div class="v" id="agree"></div></div>
+        <div class="metric"><div class="k">Latency</div><div class="v" id="lat"></div></div>
+      </div>
+      <img id="camimg" alt="Grad-CAM visualization" />
+    </div>
+  </div>
+
+  <footer>Trained on cumulonimbus vs. other clouds · python -m cli train | predict | evaluate</footer>
+
+  <script>
+    const drop = document.getElementById('drop'), fileInput = document.getElementById('file');
+    const preview = document.getElementById('preview'), go = document.getElementById('go');
+    let selectedFile = null;
+
+    drop.onclick = () => fileInput.click();
+    ['dragover','dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => {
+      e.preventDefault(); drop.classList.toggle('dragover', ev === 'dragover');
+      if (ev === 'drop' && e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+    }));
+    fileInput.onchange = () => fileInput.files.length && setFile(fileInput.files[0]);
+
+    function setFile(f){ selectedFile = f; preview.src = URL.createObjectURL(f);
+      preview.style.display='block'; go.disabled=false; hideResult(); }
+
+    const thr = document.getElementById('thr');
+    thr.oninput = () => document.getElementById('thrval').textContent = (+thr.value).toFixed(2);
+
+    function hideResult(){ document.getElementById('result').style.display='none';
+      document.getElementById('err').style.display='none'; }
+
+    go.onclick = async () => {
+      go.disabled = true; go.textContent = 'Analyzing…'; hideResult();
+      const fd = new FormData(); fd.append('image', selectedFile);
+      const params = new URLSearchParams({ threshold: thr.value, tta: document.getElementById('tta').value,
+                                          gradcam: document.getElementById('gradcam').checked ? '1':'0' });
+      try {
+        const res = await fetch('/api/predict?' + params, { method:'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        const badge = document.getElementById('badge');
+        const isCb = data.class_index === 0;
+        badge.textContent = data.label; badge.className = 'badge ' + (isCb ? 'cb' : 'other');
+        document.getElementById('conf').textContent = (data.confidence*100).toFixed(1) + '%';
+        document.getElementById('score').textContent = data.raw_score.toFixed(4)
+          + (data.calibrated ? ' ✓T=' + data.temperature.toFixed(2) : '');
+        document.getElementById('agree').textContent = Math.round((data.view_agreement||1)*100) + '%';
+        document.getElementById('lat').textContent = data.latency_ms + ' ms';
+        const cam = document.getElementById('camimg');
+        if (data.visualization_url){ cam.src = data.visualization_url + '?t=' + Date.now(); cam.style.display='block'; }
+        else cam.style.display='none';
+        document.getElementById('result').style.display='block';
+      } catch (e) {
+        const err = document.getElementById('err'); err.textContent = '✗ ' + e.message; err.style.display='block';
+      } finally { go.disabled = false; go.textContent = 'Analyze'; }
+    };
+  </script>
+</body>
+</html>
