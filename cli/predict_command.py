@@ -136,25 +136,48 @@ def resolve_temperature(calibrate: bool | None = True):
 
 def compute_gradcam(model, img_array, last_conv_name=None):
     """Grad-CAM heatmap for the given preprocessed single-image array (1,H,W,C)."""
-    conv_layers = [l for l in model.layers
-                   if "conv" in l.name.lower() and hasattr(l.output, "shape")
-                   and len(l.output_shape) == 4]
+    import tensorflow as tf
+
+    if isinstance(model, (list, tuple)):
+        model = model[0]  # ensemble: explain using the primary model
+
+    # Pick the deepest true convolutional feature extractor layer.
+    # Exclude top prediction convs (e.g. MobileNetV2 'Conv_1', 1x1x1) and
+    # depthwise separable convs, which produce degenerate/unstable CAMs.
+    def _is_good_conv(l):
+        n = l.name.lower()
+        if "depthwise" in n or "conv_" == n.rstrip("0123456789"):
+            return False
+        cfg = getattr(l, "get_config", lambda: {})()
+        if cfg.get("filters") is None:      # depthwise conv has no filters
+            return False
+        s = l.output.shape
+        return len(s) == 4 and None not in s[1:] and s[-1] >= 32
+
+    conv_layers = [l for l in model.layers if _is_good_conv(l)]
+    if not conv_layers:
+        raise RuntimeError("No suitable Conv2D layer found for Grad-CAM.")
     target = model.get_layer(last_conv_name) if last_conv_name else conv_layers[-1]
 
-    import tensorflow as tf
     img = tf.cast(img_array, tf.float32)
+
+    # Keras 3 functional models: build a sub-model once, then call it INSIDE
+    # the tape so gradients are recorded against that watched invocation.
     layer_model = tf.keras.Model(model.inputs, [target.output, model.output])
 
     with tf.GradientTape() as tape:
-        conv_out, preds = layer_model(img, training=False)
-        conv_out = conv_out[0]
-        preds = preds[0]
-        loss = preds[0] if preds.shape[-1] == 1 else tf.reduce_max(preds)
+        conv_out_full, preds = layer_model(img, training=False)
+        loss = preds[0][0] if preds.shape[-1] == 1 else tf.reduce_max(preds[0])
+        # Gradient wrt the conv activation must be requested FIRST: after the
+        # first query a non-persistent tape is released (further queries
+        # would return None on some TF builds).
+        grads = tape.gradient(loss, conv_out_full)
 
-    grads = tape.gradient(loss, conv_out)
-    weights = tf.reduce_mean(grads, axis=(0, 1))          # (C,)
-    cam = tf.nn.relu(tf.reduce_sum(conv_out * weights, axis=-1))
-    cam = cam / (cam.max() + 1e-8)
+    if grads is None:
+        raise RuntimeError("Grad-CAM gradient is None; ensure a trainable Conv2D target exists.")
+    weights = tf.reduce_mean(grads[0], axis=(0, 1))       # (C,)
+    cam = tf.nn.relu(tf.reduce_sum(conv_out_full[0] * weights, axis=-1))
+    cam = cam / (tf.reduce_max(cam) + 1e-8)
     return cam.numpy()
 
 
@@ -184,8 +207,7 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
     # Fitted on <16 samples, a validation-split temperature is statistically
     # meaningless — fall back to identity rather than distort confidence.
     if temperature != 1.0:
-        from config import CALIBRATION_PATH, load_calibration as _unused  # noqa
-    if temperature != 1.0:
+        from config import CALIBRATION_PATH
         from calibration import load_calibration
         cal = load_calibration(CALIBRATION_PATH)
         if cal and int(cal.get("n_samples", 0)) < 16:
@@ -233,7 +255,11 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
         if gradcam:
             try:
                 cam = compute_gradcam(models[0], batch[:1])
-                vis_path = f.with_name(f.stem + "_gradcam.jpg") if save_vis else None
+                vis_path = None
+                if save_vis:
+                    vis_dir = RESULTS_DIR / "gradcam"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    vis_path = vis_dir / (f.stem + "_gradcam.jpg")
                 overlay_gradcam(img_bgr, cam, vis_path)
                 entry["gradcam_saved"] = str(vis_path) if vis_path else None
             except Exception as e:  # never fail prediction because of explanation

@@ -121,5 +121,10 @@ def serve_vis(filename):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Cloud Classifier web UI")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    args = parser.parse_args()
     configure_tf_runtime(use_gpu=False)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host=args.host, port=args.port, debug=False)
