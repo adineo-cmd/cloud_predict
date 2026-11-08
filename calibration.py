@@ -4,14 +4,15 @@
 # Why this matters: a raw sigmoid output from a network trained with cross-entropy
 # is often *over-confident* (or under-confident) — e.g. it says 95% when its true
 # accuracy at that score is only ~80%. Calibration maps raw scores to trustworthy
-# probabilities, and temperature scaling lets us sharpen them so confident-and-correct
-# predictions report higher (and empirically more accurate) confidence values.
+# probabilities. Class-weighted training additionally biases the logits, which a
+# 2-parameter Platt mapping corrects (single-temperature scaling cannot).
 #
 # This module provides:
 #   * fit_temperature()      – learn a single scalar T on a held-out split
-#   * apply_temperature()    – calibrated + sharpened probability
+#   * fit_platt()            – 2-parameter Platt scaling (corrects logit bias)
+#   * apply_temperature() / apply_calibration() – map scores through the fit
 #   * expected_calibration_error() – standard calibration quality metric
-#   * evaluate_confidence()  – avg confidence on correct vs incorrect predictions
+#   * confidence_report()    – avg confidence on correct vs incorrect predictions
 #   * save/load helpers for models/calibration.json
 import json
 from pathlib import Path
@@ -22,6 +23,16 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Core math
 # ---------------------------------------------------------------------------
+def _logit(score: float) -> float:
+    eps = 1e-7
+    p = float(np.clip(score, eps, 1 - eps))
+    return float(np.log(p / (1.0 - p)))
+
+
+def _sigmoid(x: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-x)))
+
+
 def apply_temperature(score: float, temperature: float) -> float:
     """Map a raw sigmoid score through temperature T.
 
@@ -29,10 +40,15 @@ def apply_temperature(score: float, temperature: float) -> float:
     T > 1  → softened  (more conservative probabilities)
     T = 1  → identity
     """
-    eps = 1e-7
-    p = float(np.clip(score, eps, 1 - eps))
-    logit = np.log(p / (1.0 - p)) / max(float(temperature), 1e-6)
-    return float(1.0 / (1.0 + np.exp(-logit)))
+    logit = _logit(score) / max(float(temperature), 1e-6)
+    return _sigmoid(logit)
+
+
+def apply_calibration(score: float, temperature: float = 1.0, platt: dict | None = None) -> float:
+    """Apply the active calibration: Platt scaling (a·logit+b) if fitted, else temperature."""
+    if platt:
+        return _sigmoid(platt["a"] * _logit(score) + platt["b"])
+    return apply_temperature(score, temperature)
 
 
 def nll_loss(scores: np.ndarray, labels: np.ndarray, temperature: float) -> float:
@@ -76,6 +92,43 @@ def fit_temperature(scores, labels, grid_lo: float = 0.3, grid_hi: float = 3.0,
     if abs(best_loss - nll_loss(scores, labels, 1.0)) < 1e-4:
         return 1.0
     return round(best_t, 4)
+
+
+def fit_platt(scores, labels, min_samples: int = 16) -> dict | None:
+    """Fit Platt scaling (sigmoid(a·logit(s)+b)) on held-out scores.
+
+    Unlike single-temperature scaling, the additive bias term corrects the
+    systematic logit shift introduced by class-weighted training, restoring
+    meaningful probabilities at the standard 0.5 operating point.
+
+    Returns {"a": float, "b": float} or None when the data cannot support the
+    fit (too few samples, single class) or when it fails to improve NLL over
+    the identity mapping.
+    """
+    scores = np.asarray(scores, dtype=float).ravel()
+    labels = np.asarray(labels, dtype=int).ravel()
+    if scores.size < min_samples or not np.array_equal(np.unique(labels), [0, 1]):
+        return None
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        return None
+
+    X = np.array([_logit(s) for s in scores]).reshape(-1, 1)
+
+    def _nll(probs):
+        probs = np.clip(probs, 1e-7, 1 - 1e-7)
+        ll = labels * np.log(probs) + (1 - labels) * np.log(1 - probs)
+        return float(-np.mean(ll))
+
+    nll_identity = _nll(scores)
+    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
+    lr.fit(X, labels)
+    a, b = float(lr.coef_[0, 0]), float(lr.intercept_[0])
+    nll_platt = _nll(np.array([_sigmoid(a * x[0] + b) for x in X]))
+    if nll_identity - nll_platt < 1e-4:
+        return None
+    return {"a": round(a, 6), "b": round(b, 6)}
 
 
 # ---------------------------------------------------------------------------

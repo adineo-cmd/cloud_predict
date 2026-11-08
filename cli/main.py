@@ -1,6 +1,6 @@
 # cli/main.py
 # Unified professional CLI: python -m cli <command> [options]
-# Commands: train | predict | evaluate | history | benchmark
+# Commands: train | predict | evaluate | calibrate | history | benchmark
 import sys
 import logging
 
@@ -53,12 +53,12 @@ def cli(log_level):
 @click.option("--seed", type=int, default=42, show_default=True, help="Global RNG seed.")
 @click.option("--device", type=click.Choice(["cpu", "gpu"]), default=None,
               help="Override compute device.")
-def train(epochs, batch_size, lr, finetune, seed, device):
-    """Train the MobileNetV2 transfer-learning model on the dataset."""
+def train(epochs, batch_size, learning_rate, finetune, seed, device):
+    """Train the transfer-learning model (seed ensemble) on the dataset."""
     from cli.train_command import run_train
 
     run_train(
-        epochs=epochs, batch_size=batch_size, learning_rate=lr,
+        epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         finetune=finetune, seed=seed, device=device,
     )
 
@@ -69,11 +69,11 @@ def train(epochs, batch_size, lr, finetune, seed, device):
 @click.option("--threshold", type=float, default=None, help="Decision threshold (0-1).")
 @click.option("--tta", "tta_runs", type=int, default=None,
               help="Test-time augmentation views (default: CLOUD_TTA or 5; averaging "
-                   "diverse views increases stable confidence).")
+                   "diverse views stabilizes predictions).")
 @click.option("--calibrate/--no-calibrate", default=None,
               help="Apply temperature-scaled calibrated confidence (default: on).")
 @click.option("--gradcam/--no-gradcam", default=False, help="Overlay Grad-CAM explanation image.")
-@click.option("--save-vis", is_flag=True, help="Save annotated visualization alongside input.")
+@click.option("--save-vis", is_flag=True, help="Save annotated visualization to results/visualizations/.")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON result.")
 @click.option("--debug", is_flag=True, help="Show raw scores and threshold analysis.")
 def predict(images, model_path, threshold, tta_runs, gradcam, save_vis, as_json, debug,
@@ -81,8 +81,9 @@ def predict(images, model_path, threshold, tta_runs, gradcam, save_vis, as_json,
     """Predict one or more images (supports glob patterns and directories).
 
     \b
-    Confidence is boosted the honest way: multi-view TTA + final/best model
-    ensemble + temperature-scaled calibration fitted on validation data.
+    Confidence is the calibrated probability of the predicted class: a real
+    seed ensemble + multi-view TTA + a temperature fitted on the validation
+    split only. View agreement and TTA spread are reported separately.
     """
     from cli.predict_command import run_predict
 
@@ -100,10 +101,11 @@ def predict(images, model_path, threshold, tta_runs, gradcam, save_vis, as_json,
 @click.option("--optimal-threshold/--no-optimal-threshold", default=True,
               help="Search thresholds and report the best F1 operating point.")
 @click.option("--roc/--no-roc", default=True, help="Plot ROC / PR curves.")
-@click.option("--split", default="validation", show_default=True,
-              type=click.Choice(["validation", "training"]), help="Dataset split to score.")
+@click.option("--split", default="test", show_default=True,
+              type=click.Choice(["test", "validation", "training"]),
+              help="Dataset split to score (default: the held-out test split).")
 def evaluate(model_path, threshold, optimal_threshold, roc, split):
-    """Evaluate the model: precision/recall/F1, confusion matrix, ROC/PR curves."""
+    """Evaluate the ensemble: precision/recall/F1, confusion matrix, ROC/PR curves."""
     from cli.evaluate_command import run_evaluate
 
     run_evaluate(
@@ -115,11 +117,12 @@ def evaluate(model_path, threshold, optimal_threshold, roc, split):
 @cli.command()
 @click.option("--model", "model_path", default=None, help="Path to a .keras model file.")
 @click.option("--split", default="validation", show_default=True,
-              type=click.Choice(["validation", "training"]), help="Split to fit temperature on.")
+              type=click.Choice(["validation", "test", "training"]),
+              help="Split to fit temperature on (validation is what inference trusts).")
 @click.option("--apply-only", is_flag=True,
               help="Just print the currently active calibration artifact.")
 def calibrate(model_path, split, apply_only):
-    """Fit confidence calibration (temperature scaling) for higher trustworthy confidence."""
+    """Fit confidence calibration (temperature scaling) for trustworthy confidence."""
     from cli.calibrate_command import run_calibrate
 
     run_calibrate(model_path=model_path, split=split, apply_only=apply_only)
