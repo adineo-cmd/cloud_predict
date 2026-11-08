@@ -1,3 +1,20 @@
 # Python compiled files
 __pycache__/
 *.pyc
+
+# Virtual environment
+.venv/
+
+# Downloaded external data (CCSN) — regenerated via scripts/download_ccsn.py
+data/
+dataset/**/ccsn_*
+
+# Model-generated visualizations must never re-enter the training dataset
+dataset/**/*_gradcam.jpg
+
+# Runtime logs and transient outputs
+logs/
+results/web_vis/
+
+# Model weights are distributed via Hugging Face, not git
+*.keras
