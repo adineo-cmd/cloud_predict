@@ -63,7 +63,7 @@ def _brightness(img_bgr, factor: float):
 
 
 # Deterministic view generators — each entry transforms a BGR image.
-# Diverse views that average out model noise → more stable & higher confidence.
+# Diverse views that average out model noise → more stable predictions.
 _TTA_VIEWS = [
     lambda im: im,                                        # original
     lambda im: cv2.flip(im, 1),                           # horizontal flip
@@ -80,8 +80,8 @@ def _tta_batch(img_bgr, img_size, preprocess_input, runs):
     """Build a batch of deterministic augmented views for test-time augmentation.
 
     Uses up to len(_TTA_VIEWS) distinct geometric/photometric views; averaging
-    their scores suppresses single-view noise and typically raises the reported
-    confidence on genuinely classifiable images.
+    their scores suppresses single-view noise. Note: for cumulonimbus detection
+    the geometric crop views can discard diagnostic sky context (see paper).
     """
     runs = max(1, min(int(runs), len(_TTA_VIEWS)))
     batch = []
@@ -92,25 +92,47 @@ def _tta_batch(img_bgr, img_size, preprocess_input, runs):
 
 
 def load_model_ensemble(model_path=None):
-    """Load the primary model plus the best checkpoint for ensemble scoring.
+    """Load the seed-ensemble members trained by `python -m cli train`.
 
-    Averaging the final and best-validation models is a cheap way to increase
-    prediction stability and calibrated confidence. Returns (models, paths).
+    Members live in models/ensemble/member_*.keras and their probabilities are
+    averaged at inference (a genuine variance reduction). Falls back to the
+    single primary model when no ensemble directory exists. An explicit
+    --model path overrides everything and loads just that model.
+    Returns (models, paths).
     """
-    from config import MODEL_PATH, BEST_MODEL_PATH, CONFIDENCE_ENSEMBLE
+    from config import MODEL_PATH, ENSEMBLE_DIR, CONFIDENCE_ENSEMBLE
 
-    primary, ppath = _load_keras_model(model_path)
-    models, paths = [primary], [ppath]
-    if CONFIDENCE_ENSEMBLE and not model_path:
-        try:
-            best_path = Path(BEST_MODEL_PATH)
-            if best_path.exists() and best_path.resolve() != Path(ppath).resolve():
+    if model_path:
+        primary, ppath = _load_keras_model(model_path)
+        return [primary], [ppath]
+
+    models, paths = [], []
+    if CONFIDENCE_ENSEMBLE:
+        members = sorted(ENSEMBLE_DIR.glob("member_*.keras"))
+        if members:
+            try:
                 from tensorflow.keras.models import load_model
-                models.append(load_model(best_path))
-                paths.append(best_path)
-        except Exception:
-            pass  # ensemble is best-effort; never break inference over it
+                for m in members:
+                    models.append(load_model(m))
+                    paths.append(m)
+            except Exception:
+                models, paths = [], []  # fall back to primary below
+
+    if not models:
+        primary, ppath = _load_keras_model(None)
+        models, paths = [primary], [ppath]
     return models, paths
+
+
+def resolve_backbone():
+    """Backbone of the loaded artifact (from ensemble manifest, else config)."""
+    from config import BACKBONE, ENSEMBLE_MANIFEST_PATH
+    try:
+        import json
+        manifest = json.loads(Path(ENSEMBLE_MANIFEST_PATH).read_text())
+        return manifest.get("backbone", BACKBONE)
+    except Exception:
+        return BACKBONE
 
 
 def ensemble_scores(models, batch):
@@ -120,18 +142,35 @@ def ensemble_scores(models, batch):
     return float(np.mean(stacked)), stacked
 
 
-def resolve_temperature(calibrate: bool | None = True):
-    """Return the fitted temperature (1.0 disables scaling)."""
-    from config import CALIBRATION_ENABLED, CALIBRATION_PATH, DEFAULT_TEMPERATURE
+def resolve_calibration(calibrate: bool | None = True):
+    """Return (temperature, platt) from the calibration artifact.
+
+    Only artifacts fitted on the validation split (with enough samples) are
+    trusted; anything else — notably temperatures fitted on training data,
+    which inflate confidence — falls back to identity (T=1, no Platt).
+    """
+    from config import (CALIBRATION_ENABLED, CALIBRATION_PATH, DEFAULT_TEMPERATURE,
+                        CALIBRATION_TRUSTED_FIT, CALIBRATION_MIN_SAMPLES)
     from calibration import load_calibration
 
     enabled = CALIBRATION_ENABLED if calibrate is None else bool(calibrate)
     if not enabled:
-        return 1.0
+        return 1.0, None
     cal = load_calibration(CALIBRATION_PATH)
     if cal is None:
-        return DEFAULT_TEMPERATURE
-    return float(cal.get("temperature", DEFAULT_TEMPERATURE))
+        return DEFAULT_TEMPERATURE, None
+    if cal.get("fitted_on") != CALIBRATION_TRUSTED_FIT:
+        return 1.0, None
+    if int(cal.get("n_samples", 0)) < CALIBRATION_MIN_SAMPLES:
+        return 1.0, None
+    platt = cal.get("platt") if isinstance(cal.get("platt"), dict) else None
+    return float(cal.get("temperature", DEFAULT_TEMPERATURE)), platt
+
+
+def resolve_temperature(calibrate: bool | None = True):
+    """Return the fitted temperature (1.0 disables scaling). Compat wrapper."""
+    temperature, _ = resolve_calibration(calibrate)
+    return temperature
 
 
 def compute_gradcam(model, img_array, last_conv_name=None):
@@ -195,23 +234,15 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
                 gradcam=False, save_vis=False, as_json=False, debug=False,
                 calibrate=None):
     from config import (IMG_SIZE, PREDICTION_THRESHOLD, PREDICTION_LABELS, SHOW_CONFIDENCE,
-                        TTA_DEFAULT_RUNS, UNCERTAINTY_LOW_CONF)
-    from calibration import apply_temperature
-    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+                        TTA_DEFAULT_RUNS, UNCERTAINTY_LOW_CONF, VISUALIZATIONS_DIR)
+    from calibration import apply_calibration
+    from cli.data import get_preprocess_input
 
     models, mpaths = load_model_ensemble(model_path)
     thr = threshold if threshold is not None else PREDICTION_THRESHOLD
     runs = tta_runs if tta_runs is not None else TTA_DEFAULT_RUNS
-    temperature = resolve_temperature(calibrate)
-
-    # Fitted on <16 samples, a validation-split temperature is statistically
-    # meaningless — fall back to identity rather than distort confidence.
-    if temperature != 1.0:
-        from config import CALIBRATION_PATH
-        from calibration import load_calibration
-        cal = load_calibration(CALIBRATION_PATH)
-        if cal and int(cal.get("n_samples", 0)) < 16:
-            temperature = 1.0
+    temperature, platt = resolve_calibration(calibrate)
+    preprocess_input = get_preprocess_input(resolve_backbone())
 
     files = _resolve_inputs(images)
     results = []
@@ -227,14 +258,14 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
         batch = _tta_batch(img_bgr, IMG_SIZE, preprocess_input, max(1, runs))
         raw_score, stacked = ensemble_scores(models, batch)
         uncertainty = float(np.std(stacked))
-        # Consensus across views/models: disagreement dampens confidence honestly
+        # Consensus across views/models, reported as its own metric (not folded
+        # into confidence — that used to inflate the displayed number).
         agreement = float(np.mean((stacked > thr).astype(int) == (raw_score > thr)))
 
-        score = float(apply_temperature(raw_score, temperature))
+        score = float(apply_calibration(raw_score, temperature, platt))
         pred_class = 1 if score > thr else 0
         label = PREDICTION_LABELS.get(pred_class, f"Class {pred_class}")
-        base_confidence = score if pred_class == 1 else 1 - score
-        confidence = base_confidence * (0.5 + 0.5 * agreement)
+        confidence = score if pred_class == 1 else 1 - score
 
         entry = {
             "image": str(f),
@@ -245,11 +276,12 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
             "confidence": round(confidence, 4),
             "threshold": thr,
             "temperature": temperature,
+            "calibration_method": "platt" if platt else ("temperature" if temperature != 1.0 else "none"),
             "tta_runs": int(min(max(1, runs), len(_TTA_VIEWS))),
             "ensemble_models": len(models),
             "view_agreement": round(agreement, 4),
             "tta_std": round(uncertainty, 4),
-            "calibrated": abs(temperature - 1.0) > 1e-9,
+            "calibrated": bool(platt) or abs(temperature - 1.0) > 1e-9,
         }
 
         if gradcam:
@@ -257,7 +289,7 @@ def run_predict(images, model_path=None, threshold=None, tta_runs=None,
                 cam = compute_gradcam(models[0], batch[:1])
                 vis_path = None
                 if save_vis:
-                    vis_dir = RESULTS_DIR / "gradcam"
+                    vis_dir = VISUALIZATIONS_DIR / "gradcam"
                     vis_dir.mkdir(parents=True, exist_ok=True)
                     vis_path = vis_dir / (f.stem + "_gradcam.jpg")
                 overlay_gradcam(img_bgr, cam, vis_path)
