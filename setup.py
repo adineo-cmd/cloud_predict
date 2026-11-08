@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="cloud-classifier",
-    version="2.0.0",
-    description="Cumulonimbus cloud detection via MobileNetV2 transfer learning",
+    version="2.1.0",
+    description="Cumulonimbus cloud detection via transfer-learning ensembles",
     author="Cloud Classification Project",
     python_requires=">=3.9",
     packages=find_packages(include=["cli", "cli.*"]),

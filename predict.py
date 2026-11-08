@@ -57,20 +57,22 @@ def predict_image(model, image_path, show_debug=False):
     if img is None:
         return
     
-    # Confidence-boosting ensemble: multi-view TTA + final/best models + calibration
+    # Real seed ensemble: multi-view TTA + N members averaged + validation-fitted calibration
     from cli.predict_command import (load_model_ensemble, ensemble_scores,
-                                     resolve_temperature, _tta_batch)
-    from calibration import apply_temperature
+                                     resolve_calibration, _tta_batch, resolve_backbone)
+    from cli.data import get_preprocess_input
+    from calibration import apply_calibration
     from config import TTA_DEFAULT_RUNS
 
     img_bgr = cv2.imread(str(image_path))
     models, _ = load_model_ensemble(None)
-    temperature = resolve_temperature(None)
+    temperature, platt = resolve_calibration(None)
+    preprocess_input = get_preprocess_input(resolve_backbone())
     batch = _tta_batch(img_bgr, IMG_SIZE, preprocess_input, TTA_DEFAULT_RUNS)
     raw_score, stacked = ensemble_scores(models, batch)
     agreement = float(np.mean((stacked > PREDICTION_THRESHOLD).astype(int)
                               == (raw_score > PREDICTION_THRESHOLD)))
-    score = float(apply_temperature(raw_score, temperature))
+    score = float(apply_calibration(raw_score, temperature, platt))
 
     # FIXED: Standard binary classification logic
     # score > 0.5 -> class 1 -> "other"
@@ -78,9 +80,9 @@ def predict_image(model, image_path, show_debug=False):
     predicted_class = 1 if score > PREDICTION_THRESHOLD else 0
     label = PREDICTION_LABELS.get(predicted_class, f"Class {predicted_class}")
 
-    # Calibrated, consensus-weighted confidence for the predicted class
-    base_confidence = score if predicted_class == 1 else (1 - score)
-    confidence = base_confidence * (0.5 + 0.5 * agreement)
+    # Honest confidence: calibrated probability of the predicted class
+    # (view agreement is reported separately, never folded in as a boost)
+    confidence = score if predicted_class == 1 else (1 - score)
     
     print("\n" + "="*60)
     print(f"🖼️  Image: {Path(image_path).name}")
