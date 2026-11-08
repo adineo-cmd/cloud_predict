@@ -6,11 +6,11 @@ You do NOT need to run each script separately. This single entry point
 orchestrates the whole workflow end-to-end:
 
     1. setup       Install / verify dependencies (optional, --install)
-    2. train       Train the MobileNetV2 transfer-learning model
-    3. calibrate   Fit temperature scaling for trustworthy confidence
-    4. evaluate    Precision / Recall / F1, confusion matrix, ROC/PR
+    2. train       Train the transfer-learning seed ensemble
+    3. calibrate   Fit confidence calibration for trustworthy probabilities
+    4. evaluate    Precision / Recall / F1, confusion matrix, ROC/PR (test split)
     5. benchmark   Inference latency (p50/p95) and throughput
-    6. demo        Predict every sample image with Grad-CAM overlays
+    6. demo        Predict sample images with Grad-CAM overlays
     7. web         Launch the Flask web UI (default final step)
 
 Usage examples:
@@ -125,8 +125,13 @@ def _fail(msg):
 
 def cmd_demo(argv):
     """Predict a handful of dataset samples so you can see results instantly."""
-    samples = sorted((BASE_DIR / "dataset" / "cumulonimbus").glob("*.jpg"))[:2]
-    samples += sorted((BASE_DIR / "dataset" / "other").glob("*.jpg"))[:2]
+    # Only the user's own photos — never generated files (Grad-CAM overlays,
+    # downloaded CCSN images) or the training data would contaminate the demo.
+    def _own_samples(class_dir):
+        return [p for p in sorted(class_dir.glob("*.jpg"))
+                if not p.stem.endswith("_gradcam") and not p.stem.startswith("ccsn_")][:2]
+    samples = _own_samples(BASE_DIR / "dataset" / "cumulonimbus")
+    samples += _own_samples(BASE_DIR / "dataset" / "other")
     if not samples:
         return _fail("No sample images found under dataset/.")
     return _cli(["predict", *[str(p) for p in samples], "--gradcam", "--save-vis"])
@@ -172,8 +177,8 @@ Commands:
   quick         Reuse existing model and jump straight to demo + web UI
   setup         Verify/install dependencies
   train [...]   Train the model (forwards flags to 'python -m cli train')
-  calibrate     Fit temperature-scaled confidence calibration
-  evaluate      Full metrics report + ROC/PR plots
+  calibrate     Fit confidence calibration (Platt scaling / temperature)
+  evaluate      Full metrics report + ROC/PR plots (held-out test split)
   benchmark     Latency & throughput measurement
   predict ...   Predict images (supports --gradcam, --json, --tta N, ...)
   history       Show previous training-run summary & curves
