@@ -13,19 +13,20 @@ from config import (MODEL_PATH, RESULTS_DIR, IMG_SIZE, PREDICTION_THRESHOLD,
                     PREDICTION_LABELS)
 from utils import configure_tf_runtime, setup_logger
 from cli.predict_command import (_load_keras_model, _tta_batch, compute_gradcam, overlay_gradcam,
-                                 load_model_ensemble, ensemble_scores, resolve_temperature)
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from calibration import apply_temperature
+                                 load_model_ensemble, ensemble_scores, resolve_calibration,
+                                 resolve_backbone)
+from cli.data import get_preprocess_input
+from calibration import apply_calibration
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 logger = setup_logger("webapp", str(Path(__file__).resolve().parent / "logs" / "webapp.log"))
 
 _model = None
-_temperature = None
+_calibration = None
 
 
 def get_model():
-    """Ensemble of final + best models (confidence-boosting, cached)."""
+    """Seed-ensemble members (cached)."""
     global _model
     if _model is None:
         _model, paths = load_model_ensemble(None)
@@ -33,17 +34,17 @@ def get_model():
     return _model
 
 
-def get_temperature():
-    global _temperature
-    if _temperature is None:
-        _temperature = resolve_temperature(None)
-        logger.info(f"Calibration temperature T={_temperature}")
-    return _temperature
+def get_calibration():
+    global _calibration
+    if _calibration is None:
+        _calibration = resolve_calibration(None)
+        logger.info(f"Calibration: T={_calibration[0]} platt={_calibration[1]}")
+    return _calibration
 
 
 @app.route("/")
 def index():
-    return render_template("index.html", version="2.0.0")
+    return render_template("index.html", version="2.1.0")
 
 
 @app.route("/api/health")
@@ -76,14 +77,15 @@ def predict_api():
 
     t0 = time.perf_counter()
     models = get_model()
-    temperature = get_temperature()
+    temperature, platt = get_calibration()
+    preprocess_input = get_preprocess_input(resolve_backbone())
     batch = _tta_batch(img_bgr, IMG_SIZE, preprocess_input, max(1, tta))
     raw_score, stacked = ensemble_scores(models, batch)
     agreement = float(np.mean((stacked > threshold).astype(int) == (raw_score > threshold)))
-    score = float(apply_temperature(raw_score, temperature))
+    score = float(apply_calibration(raw_score, temperature, platt))
     pred_class = 1 if score > threshold else 0
-    base_confidence = score if pred_class == 1 else 1 - score
-    confidence = base_confidence * (0.5 + 0.5 * agreement)
+    # Honest confidence: the calibrated probability of the predicted class.
+    confidence = score if pred_class == 1 else 1 - score
     latency_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     payload = {
@@ -94,7 +96,8 @@ def predict_api():
         "raw_score": round(score, 6),
         "uncalibrated_score": round(raw_score, 6),
         "temperature": temperature,
-        "calibrated": abs(temperature - 1.0) > 1e-9,
+        "calibration_method": "platt" if platt else ("temperature" if temperature != 1.0 else "none"),
+        "calibrated": bool(platt) or abs(temperature - 1.0) > 1e-9,
         "view_agreement": round(agreement, 3),
         "ensemble_models": len(models),
         "latency_ms": latency_ms,

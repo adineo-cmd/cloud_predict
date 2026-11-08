@@ -1,13 +1,19 @@
 # utils.py
-# Shared utilities: reproducible seeding, hardware detection, logging, metrics export
+# Shared utilities: reproducible seeding, hardware detection, logging, metrics export,
+# seeded dataset splitting.
 import os
+import json
+import hashlib
 import random
 import logging
+from pathlib import Path
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", os.getenv("TF_CPP_MIN_LOG_LEVEL", "2"))
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", os.getenv("TF_ENABLE_ONEDNN_OPTS", "0"))
 
 import numpy as np
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def set_global_seed(seed: int = 42) -> None:
@@ -95,3 +101,108 @@ def get_git_version() -> str:
         return tag or "dev"
     except Exception:
         return "dev"
+
+
+def _is_dataset_noise(path: Path) -> bool:
+    """Model-generated files must never enter a training split (Grad-CAM overlays)."""
+    name = path.name.lower()
+    return name.endswith("_gradcam.jpg") or name.endswith("_gradcam.jpeg") \
+        or name.endswith("_gradcam.png")
+
+
+def _inventory_hash(dataset_dir: Path) -> str:
+    """Stable hash of the dataset inventory — re-split when files change."""
+    h = hashlib.sha1()
+    for cls_dir in sorted(p for p in dataset_dir.iterdir() if p.is_dir()):
+        for f in sorted(cls_dir.iterdir()):
+            if f.suffix.lower() in IMAGE_EXTS and not _is_dataset_noise(f):
+                h.update(f"{cls_dir.name}/{f.name}".encode())
+    return h.hexdigest()
+
+
+def stratified_split(dataset_dir, train_frac: float = 0.8, val_frac: float = 0.1,
+                     test_frac: float = 0.1, seed: int = 42, cache_path=None,
+                     user_photos_per_class: int = 2) -> dict:
+    """Deterministic stratified train/val/test split of the dataset folders.
+
+    Returns {"train": {class: [Path]}, "val": {...}, "test": {...}}.
+
+    Two guarantees over the old validation_split=0.2 approach:
+      * a real held-out test split exists (never used for training, checkpointing,
+        threshold search or calibration);
+      * a few of the user's own camera photos (files without the 'ccsn_' prefix)
+        are reserved for val+test when available, so held-out metrics reflect the
+        deployment domain rather than only the downloaded data distribution.
+
+    The result is cached (keyed by seed, fractions and dataset inventory) so
+    train / evaluate / calibrate always see identical splits.
+    """
+    dataset_dir = Path(dataset_dir)
+    classes = ["cumulonimbus", "other"]
+    key = {
+        "seed": seed, "train": train_frac, "val": val_frac, "test": test_frac,
+        "inventory": _inventory_hash(dataset_dir),
+    }
+    cache_file = Path(cache_path) if cache_path else None
+    if cache_file and cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            if cached.get("key") == key:
+                return {
+                    split: {cls: [Path(p) for p in files]
+                            for cls, files in cached["splits"][split].items()}
+                    for split in ("train", "val", "test")
+                }
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass  # corrupt/legacy cache — recompute below
+
+    rng = random.Random(seed)
+    splits = {s: {c: [] for c in classes} for s in ("train", "val", "test")}
+
+    for cls in classes:
+        cls_dir = dataset_dir / cls
+        if not cls_dir.exists():
+            continue
+        user_files = sorted(f for f in cls_dir.iterdir()
+                            if f.suffix.lower() in IMAGE_EXTS
+                            and not _is_dataset_noise(f)
+                            and not f.name.lower().startswith("ccsn_"))
+        ccsn_files = sorted(f for f in cls_dir.iterdir()
+                            if f.suffix.lower() in IMAGE_EXTS
+                            and not _is_dataset_noise(f)
+                            and f.name.lower().startswith("ccsn_"))
+        rng.shuffle(user_files)
+        rng.shuffle(ccsn_files)
+
+        n_total = len(user_files) + len(ccsn_files)
+        n_val = max(1, round(val_frac * n_total))
+        n_test = max(1, round(test_frac * n_total))
+
+        # Reserve user photos for val/test first (they are the scarce, deployment-
+        # domain images), then fill the remaining slots from the downloaded pool.
+        take_val_user = min(user_photos_per_class, len(user_files), n_val)
+        take_test_user = min(user_photos_per_class, len(user_files) - take_val_user, n_test)
+        splits["val"][cls] += user_files[:take_val_user]
+        splits["test"][cls] += user_files[take_val_user:take_val_user + take_test_user]
+        train_user = user_files[take_val_user + take_test_user:]
+
+        fill_val = n_val - take_val_user
+        fill_test = n_test - take_test_user
+        splits["val"][cls] += ccsn_files[:fill_val]
+        splits["test"][cls] += ccsn_files[fill_val:fill_val + fill_test]
+        # Everything not reserved for val/test goes to train (user photos + pool).
+        splits["train"][cls] += train_user + ccsn_files[fill_val + fill_test:]
+
+    for split in splits.values():
+        for cls in classes:
+            split[cls].sort(key=lambda p: str(p))
+
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        serial = {s: {c: [str(p) for p in files] for c, files in pairs.items()}
+                  for s, pairs in splits.items()}
+        cache_file.write_text(json.dumps({"key": key, "splits": serial}, indent=2))
+
+    sizes = {s: sum(len(v) for v in splits[s].values()) for s in splits}
+    logging.getLogger(__name__).info(f"Dataset split sizes: {sizes}")
+    return splits
